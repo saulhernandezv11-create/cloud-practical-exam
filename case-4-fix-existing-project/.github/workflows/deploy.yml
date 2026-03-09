@@ -1,0 +1,102 @@
+# pipeline corregido - ver docs/case-4.md para el detalle de cada fix
+name: deploy lambda
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  FUNCTION_NAME: interview-lambda
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: instalar dependencias
+        run: pip install -r app/requirements.txt
+
+      - name: correr tests
+        # fix 1: correr desde app/ para que Python encuentre el módulo main
+        run: cd app && python -m pytest . -v --tb=short
+
+      - name: configurar credenciales aws
+        # fix 3: este step faltaba completamente en el pipeline original
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: guardar versión actual por si hay que hacer rollback
+        id: version_actual
+        run: |
+          V=$(aws lambda list-versions-by-function \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --query 'Versions[-2].Version' \
+            --output text 2>/dev/null || echo "1")
+          echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: empaquetar lambda
+        # fix 2: el original hacía zip app/* que metía test_main.py
+        # y no incluía las dependencias. Esto lo arregla.
+        run: |
+          mkdir -p package
+          pip install -r app/requirements.txt -t package/ -q
+          cp app/main.py package/
+          cd package && zip -r ../function.zip . \
+            -x "*.pyc" \
+            -x "__pycache__/*" \
+            -x "*.dist-info/*"
+
+      - name: subir código
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --zip-file fileb://function.zip \
+            --architectures arm64
+
+          # fix 5: esperar a que termine la actualización antes de continuar
+          aws lambda wait function-updated \
+            --function-name ${{ env.FUNCTION_NAME }}
+
+      - name: publicar versión
+        id: version_nueva
+        run: |
+          V=$(aws lambda publish-version \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --description "run ${{ github.run_number }} | ${{ github.sha }}" \
+            --query 'Version' \
+            --output text)
+          echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: smoke test
+        # fix 6: el original no tenía ninguna verificación post-deploy
+        id: smoke
+        run: |
+          STATUS=$(aws lambda invoke \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --payload '{"name":"smoke"}' \
+            --query 'StatusCode' \
+            --output text \
+            /tmp/response.json)
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          cat /tmp/response.json
+
+      - name: rollback si el smoke test falló
+        if: steps.smoke.outputs.status != '200'
+        run: |
+          echo "smoke test falló, volviendo a versión ${{ steps.version_actual.outputs.version }}"
+          aws lambda update-alias \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --name prod \
+            --function-version ${{ steps.version_actual.outputs.version }} || true
+          exit 1

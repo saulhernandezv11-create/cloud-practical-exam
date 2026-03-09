@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["template/tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"

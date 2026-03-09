@@ -1,0 +1,190 @@
+name: deploy app
+
+on:
+  push:
+    branches: [main, staging, develop]
+  pull_request:
+    branches: [main, staging]
+
+env:
+  PHP_VERSION: '8.2'
+  NODE_VERSION: '20'
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    name: tests php
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+          MYSQL_DATABASE: testing
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping" --health-interval=10s
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, bcmath, pdo_mysql, redis
+
+      - name: cache composer
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader
+      - run: cp .env.example .env.testing && php artisan key:generate --env=testing
+      - run: php artisan migrate --env=testing --force
+      - run: php artisan test --env=testing
+
+  build:
+    name: build php + vue
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: cache composer
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - name: cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-${{ hashFiles('package-lock.json') }}
+
+      - run: composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: optimizaciones laravel para producción
+        run: |
+          php artisan config:cache
+          php artisan route:cache
+          php artisan view:cache
+
+      - name: armar zip de deploy
+        run: |
+          zip -r deployment.zip \
+            app/ bootstrap/ config/ database/ public/ resources/ routes/ storage/ vendor/ artisan \
+            -x "*.git*" -x "node_modules/*" -x "tests/*" -x "storage/logs/*"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploy-${{ github.sha }}
+          path: deployment.zip
+          retention-days: 5
+
+  deploy:
+    name: deploy a elastic beanstalk
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.event_name == 'push'
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+    env:
+      AMBIENTE: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: deploy-${{ github.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: subir a s3 y desplegar en elastic beanstalk
+        run: |
+          LABEL="${{ env.AMBIENTE }}-${{ github.sha }}"
+
+          aws s3 cp deployment.zip s3://${{ secrets.EB_BUCKET }}/deploys/${LABEL}.zip
+
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ secrets.EB_APP }} \
+            --version-label $LABEL \
+            --source-bundle S3Bucket=${{ secrets.EB_BUCKET }},S3Key=deploys/${LABEL}.zip
+
+          aws elasticbeanstalk update-environment \
+            --application-name ${{ secrets.EB_APP }} \
+            --environment-name ${{ secrets.EB_APP }}-${{ env.AMBIENTE }} \
+            --version-label $LABEL
+
+          aws elasticbeanstalk wait environment-updated \
+            --application-name ${{ secrets.EB_APP }} \
+            --environment-names ${{ secrets.EB_APP }}-${{ env.AMBIENTE }}
+
+      - name: migraciones de base de datos
+        run: |
+          # ejecutar via SSM en la instancia de EB
+          INSTANCE=$(aws ec2 describe-instances \
+            --filters "Name=tag:elasticbeanstalk:environment-name,Values=${{ secrets.EB_APP }}-${{ env.AMBIENTE }}" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)
+
+          CMD=$(aws ssm send-command \
+            --instance-ids $INSTANCE \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /var/app/current && php artisan migrate --force"]' \
+            --query 'Command.CommandId' --output text)
+
+          aws ssm wait command-executed \
+            --command-id $CMD --instance-id $INSTANCE
+
+  verificar:
+    name: health check
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.event_name == 'push'
+    env:
+      AMBIENTE: ${{ github.ref_name == 'main' && 'prod' || github.ref_name == 'staging' && 'staging' || 'dev' }}
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: health check con reintentos
+        id: hc
+        run: |
+          URL="${{ secrets.APP_URL }}"
+          for i in 1 2 3; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo "000")
+            [ "$STATUS" == "200" ] && echo "ok=true" >> $GITHUB_OUTPUT && exit 0
+            echo "intento $i falló (HTTP $STATUS), esperando..."
+            sleep 20
+          done
+          echo "ok=false" >> $GITHUB_OUTPUT
+
+      - name: rollback si el health check falla
+        if: steps.hc.outputs.ok == 'false'
+        run: |
+          aws elasticbeanstalk rebuild-environment \
+            --environment-name ${{ secrets.EB_APP }}-${{ env.AMBIENTE }} || true
+          exit 1

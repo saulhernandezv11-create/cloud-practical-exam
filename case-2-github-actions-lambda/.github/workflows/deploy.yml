@@ -1,0 +1,188 @@
+name: deploy lambda
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+    paths:
+      - 'case-1-lambda-template/template/src/**'
+      - 'case-2-github-actions-lambda/src/**'
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      accion:
+        description: 'deploy o rollback'
+        required: true
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      ambiente:
+        description: 'Ambiente destino'
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+      lambda_name:
+        description: 'Nombre de la función'
+        required: true
+        default: 'mi-lambda-multienv'
+      version_rollback:
+        description: 'Número de versión para rollback (solo si accion=rollback)'
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+  LAMBDA_NAME: ${{ github.event.inputs.lambda_name || 'mi-lambda-multienv' }}
+
+jobs:
+  resolver-ambiente:
+    runs-on: ubuntu-latest
+    outputs:
+      ambiente: ${{ steps.res.outputs.ambiente }}
+    steps:
+      - id: res
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "ambiente=${{ github.event.inputs.ambiente }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "ambiente=prod" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" == "staging" ]; then
+            echo "ambiente=staging" >> $GITHUB_OUTPUT
+          else
+            echo "ambiente=dev" >> $GITHUB_OUTPUT
+          fi
+
+  rollback:
+    runs-on: ubuntu-latest
+    needs: resolver-ambiente
+    if: github.event.inputs.accion == 'rollback'
+    environment: ${{ needs.resolver-ambiente.outputs.ambiente }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: mover alias a versión anterior
+        run: |
+          VERSION="${{ github.event.inputs.version_rollback }}"
+          [ -z "$VERSION" ] && echo "falta version_rollback" && exit 1
+
+          aws lambda update-alias \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --name ${{ needs.resolver-ambiente.outputs.ambiente }} \
+            --function-version $VERSION \
+            --description "rollback por ${{ github.actor }} | run ${{ github.run_id }}"
+
+          echo "rollback a versión $VERSION completado"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: resolver-ambiente
+    if: github.event.inputs.accion != 'rollback'
+    environment: ${{ needs.resolver-ambiente.outputs.ambiente }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: tests
+        run: |
+          pip install pytest -q
+          cd case-1-lambda-template/template && python -m pytest tests/ -v
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: guardar versión actual (por si hay rollback)
+        id: version_actual
+        if: needs.resolver-ambiente.outputs.ambiente == 'prod'
+        run: |
+          V=$(aws lambda get-alias \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --name prod \
+            --query 'FunctionVersion' --output text 2>/dev/null || echo "1")
+          echo "version=$V" >> $GITHUB_OUTPUT
+
+      - name: empaquetar
+        run: |
+          mkdir -p package
+          pip install \
+            -r case-1-lambda-template/template/requirements.txt \
+            -t package/ -q
+          cp case-1-lambda-template/template/src/lambda_function.py package/
+          cd package && zip -r ../function.zip . -x "*.pyc" -x "__pycache__/*"
+
+      - name: subir código
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://function.zip \
+            --architectures arm64
+          aws lambda wait function-updated --function-name ${{ env.LAMBDA_NAME }}
+
+      - name: aplicar variables de entorno
+        run: |
+          ARCHIVO="case-2-github-actions-lambda/src/${{ needs.resolver-ambiente.outputs.ambiente }}.env.json"
+          VARS=$(python3 -c "
+          import json
+          d = json.load(open('$ARCHIVO'))
+          print(','.join(f'{k}={v}' for k,v in d.items()))
+          ")
+          aws lambda update-function-configuration \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --environment "Variables={$VARS}"
+          aws lambda wait function-updated --function-name ${{ env.LAMBDA_NAME }}
+
+      - name: publicar versión
+        id: version_nueva
+        run: |
+          V=$(aws lambda publish-version \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --description "${{ needs.resolver-ambiente.outputs.ambiente }} | ${{ github.sha }}" \
+            --query 'Version' --output text)
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "versión publicada: $V"
+
+      - name: actualizar alias
+        run: |
+          ALIAS="${{ needs.resolver-ambiente.outputs.ambiente }}"
+          TARGET="${{ steps.version_nueva.outputs.version }}"
+          [ "$ALIAS" == "dev" ] && TARGET='$LATEST'
+
+          aws lambda update-alias \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --name $ALIAS \
+            --function-version $TARGET
+
+      - name: smoke test
+        id: smoke
+        run: |
+          STATUS=$(aws lambda invoke \
+            --function-name "${{ env.LAMBDA_NAME }}:${{ needs.resolver-ambiente.outputs.ambiente }}" \
+            --payload '{}' --output json /tmp/resp.json \
+            --query 'StatusCode' --output text)
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          [ "$STATUS" == "200" ] && echo "ok" || echo "fallo"
+
+      - name: rollback automático si el smoke test falla (solo prod)
+        if: needs.resolver-ambiente.outputs.ambiente == 'prod' && steps.smoke.outputs.status != '200'
+        run: |
+          echo "smoke test falló, volviendo a versión ${{ steps.version_actual.outputs.version }}"
+          aws lambda update-alias \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --name prod \
+            --function-version ${{ steps.version_actual.outputs.version }} \
+            --description "rollback automático | run ${{ github.run_id }}"
+          exit 1
