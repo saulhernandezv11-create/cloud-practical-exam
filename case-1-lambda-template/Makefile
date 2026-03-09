@@ -1,6 +1,6 @@
 .PHONY: deploy destroy test lint help
 
-NAME    ?= mi-lambda
+NAME    ?= cloud-test-envioclick
 ENV     ?= dev
 REGION  ?= us-east-1
 MEMORY  ?= 128
