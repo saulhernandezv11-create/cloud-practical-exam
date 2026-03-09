@@ -24,10 +24,3 @@ La documentación detallada de cada caso está en [docs/](./docs/).
 - GitHub Actions
 - Python 3.13
 
-## Requerimientos previos
-
-```bash
-aws configure          # credenciales AWS
-terraform -version     # >= 1.5.0
-python3 --version      # 3.13
-```
