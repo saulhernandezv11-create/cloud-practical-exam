@@ -1,4 +1,4 @@
-variable "lambda_name" {
+variable "cloud-test-envioclick" {
   type = string
   validation {
     condition     = can(regex("^[a-zA-Z0-9_-]+$", var.lambda_name))
